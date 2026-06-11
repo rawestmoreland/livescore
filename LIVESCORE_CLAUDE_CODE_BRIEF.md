@@ -1,6 +1,6 @@
 # LocalScore — Claude Code Brief
 
-## Realtime Sports League Tracker (v2 — TanStack Start + PocketBase)
+## Realtime Sports League Tracker (v3 — SPA + PocketBase)
 
 ---
 
@@ -12,27 +12,45 @@ Intentionally **not** a full league management suite. No payments, no complex re
 
 ---
 
+## Architecture decision: SPA, no SSR
+
+This app does not need SSR. Every route is either:
+
+- **Realtime-first** — the page is stale the moment it's server-rendered anyway; a PocketBase subscription immediately overwrites it
+- **Auth-gated** — organizer dashboard and scorekeeper have no SEO or sharing value
+- **Navigated to internally** — users reach game pages from the league hub, not cold links
+
+The only legitimate SSR use case would be OG meta tags on the public league hub (`/[slug]`) for link previews in iMessage/WhatsApp. This is handled with a lightweight meta tag endpoint on the PocketBase server (see below) — not a full SSR framework.
+
+**Use Vite + TanStack Router as a pure SPA.** No TanStack Start, no hydration complexity, no isomorphic PocketBase gotchas. PocketBase's realtime subscriptions are designed exactly for this use case.
+
+---
+
 ## Tech stack
 
 ### Backend — PocketBase
 
 Single Go binary. Built-in realtime SSE subscriptions, auth, REST API, and admin UI. Deploy on a $4–6/mo Hetzner or Fly.io VPS. No Docker required. Collections: `leagues`, `teams`, `games`, `score_events`. A `pb_hooks` JS hook handles score increments server-side.
 
-### Frontend — TanStack Start (React + TypeScript)
+### Frontend — Vite + TanStack Router (React + TypeScript)
 
-Full-stack React framework with SSR. File-based routing via TanStack Router. Use `createServerFn` for data fetching on public SSR routes. PocketBase JS SDK (`pocketbase` npm package) for auth and realtime subscriptions on the client. No special adapter needed — TanStack Start handles SSR + client hydration.
+Pure SPA. File-based routing via TanStack Router. No server-side rendering. PocketBase JS SDK (`pocketbase` npm package) for auth and realtime subscriptions. Built with Vite — fast dev server, simple static output.
 
 ### Server state — TanStack Query
 
-Use `useSuspenseQuery` for initial data load on all routes. Layer PocketBase's realtime subscription inside a `useEffect` to push updates into the query cache via `queryClient.setQueryData`. This keeps SSR data and live updates in sync through a single data layer.
+Use `useQuery` / `useSuspenseQuery` for all data fetching. Layer PocketBase realtime subscriptions inside `useEffect` to push live updates into the query cache via `queryClient.setQueryData`. Components only ever read from the cache — they don't care if data arrived from an initial fetch or a realtime push.
 
 ### Styling — Tailwind CSS v4
 
 Utility-first. No component library — keep the bundle lean and the scoreboard UI custom. Add a `manifest.webmanifest` and service worker for PWA installability on the scorekeeper route.
 
+### OG meta tags (optional, lightweight)
+
+A single PocketBase JS hook serves a minimal HTML shell with populated `<meta>` tags when a crawler `User-Agent` hits `/[slug]`. ~30 lines. Everything else is served as the standard SPA `index.html`. This is the only "server rendering" in the project.
+
 ### Deployment
 
-PocketBase binary + TanStack Start Node server on the same VPS. Nginx reverse proxy: port 80/443 → Node (web), `/api/` and `/_/` → PocketBase (port 8090). One-command deploy via a shell script in the repo root.
+PocketBase binary + Vite static build (`dist/`) on the same VPS. Nginx serves the static files and proxies `/api/` and `/_/` to PocketBase (port 8090). One-command deploy via a shell script in the repo root.
 
 ---
 
@@ -40,20 +58,16 @@ PocketBase binary + TanStack Start Node server on the same VPS. Nginx reverse pr
 
 > **Realtime is the core differentiator.** Every public viewer on a live game page must see score changes within ~500ms of entry — no polling, no manual refresh.
 
-The pattern for every realtime-enabled page:
+The pattern for every realtime-enabled component:
 
 ```ts
-// 1. Load initial data server-side (SSR)
-const loaderData = Route.useLoaderData();
-
-// 2. Seed query cache from loader data
-const { data: game } = useSuspenseQuery({
+// 1. Initial data fetch via TanStack Query
+const { data: game } = useQuery({
   queryKey: ['game', gameId],
   queryFn: () => pb.collection('games').getOne(gameId),
-  initialData: loaderData.game,
 });
 
-// 3. Subscribe to realtime updates → push into cache
+// 2. Subscribe to realtime updates → push into cache
 useEffect(() => {
   pb.collection('games').subscribe(gameId, ({ record }) => {
     queryClient.setQueryData(['game', gameId], record);
@@ -62,7 +76,7 @@ useEffect(() => {
 }, [gameId]);
 ```
 
-Also subscribe to the `games` collection (filtered by `league_id`) on the league hub page so a game transitioning to `live` or `final` surfaces without a reload.
+Also subscribe to the `games` collection (filtered by `league_id`) on the league hub so a game transitioning to `live` or `final` surfaces without a reload.
 
 ---
 
@@ -96,23 +110,23 @@ standings               ← computed via PocketBase view collection
 
 ## Routes
 
-| File                         | Purpose                                              | Rendering       |
-| ---------------------------- | ---------------------------------------------------- | --------------- |
-| `routes/index.tsx`           | Product landing + create league CTA                  | SSR             |
-| `routes/$slug.tsx`           | Public league hub — live scores, standings, schedule | SSR             |
-| `routes/$slug.game.$id.tsx`  | Live game view — realtime score, period, event log   | SSR             |
-| `routes/dashboard.tsx`       | Organizer dashboard — manage leagues, games, teams   | CSR, auth-gated |
-| `routes/scorekeeper.$id.tsx` | Mobile-first live score entry. PWA. PIN auth.        | CSR             |
+| File                         | Purpose                                                         |
+| ---------------------------- | --------------------------------------------------------------- |
+| `routes/index.tsx`           | Product landing + create league CTA                             |
+| `routes/$slug.tsx`           | Public league hub — live scores, standings, schedule            |
+| `routes/$slug.game.$id.tsx`  | Live game view — realtime score, period, event log              |
+| `routes/dashboard.tsx`       | Organizer dashboard — manage leagues, games, teams. Auth-gated. |
+| `routes/scorekeeper.$id.tsx` | Mobile-first live score entry. PWA. PIN auth.                   |
 
-> **Note:** SSR only applies to public routes. The dashboard and scorekeeper routes are client-rendered — disable SSR per-route via TanStack Start's route options or wrap in a `ClientOnly` boundary.
+All routes are client-rendered. No SSR anywhere.
 
 ---
 
 ## Auth model
 
-**Public (no auth):** View any league hub, game scoreboard, standings. SSR-rendered, fully public, OG meta tags for link sharing.
+**Public (no auth):** View any league hub, game scoreboard, standings.
 
-**Organizer (email/password via PocketBase auth):** Create/edit leagues, teams, games. Access `/dashboard`. Store the PocketBase auth token in a cookie (httpOnly) for SSR access. Use a TanStack Router `beforeLoad` guard to redirect unauthenticated users.
+**Organizer (email/password via PocketBase auth):** Create/edit leagues, teams, games. Access `/dashboard`. Store the PocketBase auth token in `localStorage` (PocketBase SDK handles this automatically). Use a TanStack Router `beforeLoad` guard to redirect unauthenticated users to a login page.
 
 **Scorekeeper (6-digit PIN):** A PIN is stored on each `games` record. The scorekeeper route prompts for the PIN, validates against PocketBase, and stores a short-lived token in `sessionStorage`. Cannot access any other route. Screen Wake Lock API should be enabled to prevent phone sleep mid-game.
 
@@ -126,16 +140,17 @@ localscore/
 │   ├── pocketbase                   # binary (gitignored)
 │   ├── pb_migrations/               # schema as migration files
 │   ├── pb_hooks/
-│   │   └── scores.pb.js             # score increment + undo hook
+│   │   ├── scores.pb.js             # score increment + undo hook
+│   │   └── og-meta.pb.js            # crawler meta tag handler (optional)
 │   └── seed.js                      # demo league seed script
-├── web/                             # TanStack Start app
-│   ├── app/
+├── web/                             # Vite + TanStack Router SPA
+│   ├── src/
 │   │   ├── routes/
 │   │   │   ├── index.tsx            # landing
-│   │   │   ├── $slug.tsx            # league hub (SSR)
-│   │   │   ├── $slug.game.$id.tsx   # live game (SSR)
-│   │   │   ├── dashboard.tsx        # organizer (CSR, auth-gated)
-│   │   │   └── scorekeeper.$id.tsx  # score entry (CSR, PWA)
+│   │   │   ├── $slug.tsx            # league hub
+│   │   │   ├── $slug.game.$id.tsx   # live game view
+│   │   │   ├── dashboard.tsx        # organizer (auth-gated)
+│   │   │   └── scorekeeper.$id.tsx  # score entry (PWA)
 │   │   ├── lib/
 │   │   │   ├── pb.ts                # PocketBase client singleton
 │   │   │   ├── queries/             # queryOptions factories per entity
@@ -149,12 +164,12 @@ localscore/
 │   │   │   ├── StandingsTable.tsx
 │   │   │   ├── GameCard.tsx
 │   │   │   └── ScorekeeperPad.tsx
-│   │   ├── router.tsx
-│   │   └── client.tsx
+│   │   ├── main.tsx
+│   │   └── router.tsx
 │   ├── public/
 │   │   ├── manifest.webmanifest     # PWA manifest
 │   │   └── sw.js                    # service worker (scorekeeper)
-│   └── app.config.ts                # TanStack Start config
+│   └── vite.config.ts
 ├── nginx.conf
 └── README.md
 ```
@@ -165,27 +180,27 @@ localscore/
 
 ### Phase 1 — PocketBase schema + seed
 
-Create all collections with correct field types, indexes, and API rules. Write a seed script that creates a demo league ("Riverside 5-a-side") with 4 teams and 6 sample games in various statuses. Verify realtime works with a simple HTML test client before touching the React app.
+Create all collections with correct field types, indexes, and API rules. Write a seed script that creates a demo league ("Riverside 5-a-side") with 4 teams and 6 sample games in various statuses. Verify realtime works with a simple standalone HTML test file that subscribes to the `games` collection before touching the React app.
 
-### Phase 2 — TanStack Start scaffold + PocketBase integration
+### Phase 2 — Vite + TanStack Router scaffold + PocketBase integration
 
-Init TanStack Start project. Install `pocketbase`, `@tanstack/react-query`. Create the `pb.ts` singleton (handles both server and client environments — check `typeof window`). Write `queryOptions` factories for leagues, games, and standings. Confirm SSR data loading works on the slug route with a static fixture.
+Init Vite project with React + TypeScript template. Install `@tanstack/react-router`, `@tanstack/react-query`, `pocketbase`. Set up TanStack Router with file-based routing. Create the `pb.ts` client singleton. Write `queryOptions` factories for leagues, games, and standings. Confirm data fetching and realtime subscriptions work end-to-end against the seeded PocketBase instance.
 
 ### Phase 3 — Public league hub (`$slug.tsx`)
 
-SSR page showing league name/sport, live games (highlighted), standings table, upcoming schedule. Wire up realtime subscription for live game status and score changes. Add OG meta tags (title, description, image) for link sharing previews.
+Page showing league name/sport, live games (highlighted), standings table, upcoming schedule. Wire up realtime subscription so game status and score changes update without a reload. This is the most-viewed route — make it fast and readable on mobile.
 
 ### Phase 4 — Live game view + scorekeeper entry
 
-SSR game view with large score display, period indicator, and event log. Separate `scorekeeper.$id.tsx` (CSR only) with large +/- tap targets (min 56px), period control, undo last event, and "End game" inline confirmation. Enable Screen Wake Lock API. Add PWA manifest so it's installable.
+Game view with large score display, period indicator, and event log. Separate `scorekeeper.$id.tsx` with large +/- tap targets (min 56px), period control, undo last event, and "End game" inline confirmation. Enable Screen Wake Lock API (`navigator.wakeLock.request('screen')`) on mount. Add PWA manifest so the route is installable.
 
 ### Phase 5 — Organizer dashboard
 
-Auth-gated `/dashboard` with `beforeLoad` redirect guard. Create league form with slug availability check (debounced PocketBase filter call). Team management. Game scheduler with home/away picker and datetime. Generate and display scorekeeper PIN per game.
+Auth-gated `/dashboard` with `beforeLoad` redirect guard. Login page. Create league form with slug availability check (debounced PocketBase filter call). Team management. Game scheduler with home/away picker and datetime. Generate and display scorekeeper PIN per game.
 
 ### Phase 6 — Polish + deployment
 
-Empty states, error boundaries, loading skeletons. Nginx config. README with step-by-step deploy instructions (buy VPS → install Node + PocketBase → clone repo → run `deploy.sh`). PocketBase backup cron example.
+Empty states, error boundaries, loading skeletons. Nginx config. README with step-by-step deploy instructions (buy VPS → install Node + PocketBase → clone repo → run `deploy.sh`). PocketBase backup cron example. Optional: add the OG meta tag hook (`og-meta.pb.js`) for link preview support.
 
 ---
 
@@ -195,13 +210,13 @@ Empty states, error boundaries, loading skeletons. Nginx config. README with ste
 
 Scorekeeper POSTs a new record to `score_events` (append-only). A `pb_hooks/scores.pb.js` hook on `onRecordAfterCreateRequest` atomically increments the correct score field on the parent `games` record. This prevents race conditions and makes "undo last point" trivial — just delete the last `score_events` record and decrement.
 
-### PocketBase singleton — isomorphic safe
-
-TanStack Start runs code on both server and client. The `pb.ts` singleton must guard against SSE subscriptions being opened server-side. Only call `pb.collection(...).subscribe()` inside `useEffect` (client-only). For server data fetching in `createServerFn`, use a separate server-only PocketBase instance with admin credentials from env vars.
-
 ### Query cache as the single source of truth
 
-Don't use `useState` for server data. All game/league data lives in TanStack Query's cache. SSR seeds it via `initialData` in `useSuspenseQuery`. Realtime pushes update it via `queryClient.setQueryData`. Components just read from the cache — they never know if data came from SSR or a realtime push.
+Don't use `useState` for server data. All game/league data lives in TanStack Query's cache. Initial data arrives via `useQuery`. Realtime pushes update it via `queryClient.setQueryData`. Components just read from the cache — they never know whether data came from a fetch or a realtime event.
+
+### PocketBase singleton — client only
+
+Unlike an SSR setup, there is no isomorphic concern here. The `pb.ts` singleton is a plain module-level instance created once on the client. PocketBase SDK handles auth token persistence in `localStorage` automatically. Subscriptions can be opened anywhere — no `typeof window` guards needed.
 
 ### Standings as a PocketBase view collection
 
@@ -213,12 +228,17 @@ The league slug is the public URL identifier. Add a unique index on `leagues.slu
 
 ### Scorekeeper view — mobile-first
 
-The `/scorekeeper` route must work one-handed on a phone. Score buttons must have a minimum 56px tap target. Undo last event must be accessible without scrolling. Avoid modals — use inline confirmation for destructive actions like "End game". Enable the Screen Wake Lock API (`navigator.wakeLock.request('screen')`) on mount to prevent the phone sleeping mid-game.
+Score buttons must have a minimum 56px tap target. Undo last event must be accessible without scrolling. Avoid modals — use inline confirmation for destructive actions like "End game". Enable the Screen Wake Lock API on mount to prevent the phone sleeping mid-game. The route should work reliably on a $200 Android phone on a spotty gym WiFi connection.
+
+### Nginx SPA fallback
+
+The Nginx config must include `try_files $uri $uri/ /index.html` so that deep-linking directly to `/riverside-fc` or `/scorekeeper/abc123` works correctly rather than returning a 404.
 
 ---
 
 ## Out of scope for v1
 
+- Server-side rendering (SSR)
 - React Native / Expo
 - Push notifications
 - Payment processing
@@ -235,6 +255,6 @@ The `/scorekeeper` route must work one-handed on a phone. Score buttons must hav
 - [ ] An organizer can create a league, add teams, and schedule games in under 5 minutes
 - [ ] A scorekeeper on mobile can increment scores and advance periods with no friction, with the screen staying awake
 - [ ] Fans viewing the public scoreboard see score changes within 1 second, no refresh required
-- [ ] The league hub page renders correctly when shared as a link (SSR + OG meta tags populate)
 - [ ] The scorekeeper route is installable as a PWA from mobile Safari and Chrome
+- [ ] Direct links to `/[slug]` and `/scorekeeper/[id]` work correctly (Nginx SPA fallback configured)
 - [ ] Full app deploys to a fresh VPS following only the README instructions
